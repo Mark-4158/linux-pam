@@ -10,7 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <utmpx.h>
+#include <errno.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -37,6 +43,8 @@ const char *pam_misc_conv_warn_line = N_("...Time is running out...\n");
 const char *pam_misc_conv_die_line  = N_("...Sorry, your time is up!\n");
 
 int pam_misc_conv_died=0;       /* application can probe this for timeout */
+
+static int *pipe_fd = NULL;
 
 /*
  * These functions are for binary prompt manipulation.
@@ -127,6 +135,105 @@ static int get_delay(void)
 	return 0;
 }
 
+static inline void *init_file_actions(void *fa)
+{
+    if (posix_spawn_file_actions_init(fa) ||
+	posix_spawn_file_actions_adddup2(fa, pipe_fd[1], STDOUT_FILENO)) {
+	posix_spawn_file_actions_destroy(fa);
+
+	return NULL;
+    }
+
+    return fa;
+}
+
+static int exec_command(char *arg2)
+{
+    void *fa = pipe_fd ? init_file_actions((posix_spawn_file_actions_t[1]) { })
+		       : NULL;
+    char arg0[] = "sh";
+    char arg1[] = "-c";
+    pid_t child = 0;
+    int ws = 0, ret = 0;
+
+    if (posix_spawn(&child,
+		    _PATH_BSHELL,
+		    fa,
+		    NULL,
+		    (char *const[4]) { arg0, arg1, arg2 },
+		    environ) ||
+        waitpid(child, &ws, 0) != child ||
+	!WIFEXITED(ws) ||
+	WEXITSTATUS(ws) != EXIT_SUCCESS ) {
+	ret = -1;
+    }
+
+    memset(arg0, 0, sizeof arg0);
+    memset(arg1, 0, sizeof arg1);
+    if (fa) {
+	posix_spawn_file_actions_destroy(fa);
+    }
+
+    return ret;
+}
+
+static void plymouth_cb(void)
+{
+    const struct utmpx *const ut = getutxent();
+
+    if (!ut || ut->ut_type == BOOT_TIME ) {
+	char arg2[] = "plymouth --has-active-vt &&"
+		      "plymouth --quit &&"
+		      "plymouth --wait";
+
+	endutxent();
+	pipe_fd = NULL;
+	exec_command(arg2);
+	memset(arg2, 0, sizeof arg2);
+    }
+}
+
+static inline int plymouth_check(void)
+{
+    char arg2[] = "plymouth --has-active-vt &&"
+		  "plymouth --show-splash";
+    int ret = exec_command(arg2);
+
+    memset(arg2, 0, sizeof arg2);
+
+    return ret ? ret : pthread_atfork(plymouth_cb, NULL, NULL);
+}
+
+static inline void plymouth_prompt(int echo, const char *prompt)
+{
+    const char *strs[] = {
+	prompt,
+	" --prompt='",
+	echo ? "question" : "for-password",
+	"plymouth ask-",
+    };
+    char arg2[strlen(prompt)+38];
+
+    echo = 0;
+    for (int i = 4; i--;) {
+	for (int j = -1; (arg2[echo] = strs[i][++j]);)
+	    ++echo;
+    }
+
+    while (!isalnum(arg2[--echo])) { }
+
+    arg2[echo+1] = '\'';
+    arg2[echo+2] = '\0';
+
+    echo = exec_command(arg2);
+    memset(strs, 0, sizeof strs);
+    memset(arg2, 0, sizeof arg2);
+
+    if (echo) {
+	abort();
+    }
+}
+
 /* read a line of input string, giving prompt when appropriate */
 static int read_string(int echo, const char *prompt, char **retstr)
 {
@@ -182,7 +289,11 @@ static int read_string(int echo, const char *prompt, char **retstr)
 	    break;
 	} else {
 	    if (have_term)
-		nc = read(STDIN_FILENO, line, INPUTSIZE-1);
+		nc = read(pipe_fd ? plymouth_prompt(echo, prompt),
+				    pipe_fd[0]
+				  : STDIN_FILENO,
+			  line,
+			  INPUTSIZE-1);
 	    else                             /* we must read one line only */
 		for (nc = 0; nc < INPUTSIZE-1 && (nc?line[nc-1]:0) != '\n';
 		     nc++) {
@@ -286,6 +397,9 @@ int misc_conv(int num_msg, const struct pam_message **msgm,
     if (num_msg <= 0)
 	return PAM_CONV_ERR;
 
+    if ((pipe_fd || !plymouth_check()) && pipe(pipe_fd = (int[2]) { }))
+	return PAM_CONV_ERR;
+
     D(("allocating empty response structure array."));
 
     reply = calloc(num_msg, sizeof(struct pam_response));
@@ -362,12 +476,22 @@ int misc_conv(int num_msg, const struct pam_message **msgm,
 	}
     }
 
+    if (pipe_fd) {
+	for (count=2; count--;)
+	    close(pipe_fd[count]);
+    }
+
     *response = reply;
     reply = NULL;
 
     return PAM_SUCCESS;
 
 failed_conversation:
+
+    if (pipe_fd) {
+	for (count=2; count--;)
+	    close(pipe_fd[count]);
+    }
 
     D(("the conversation failed"));
 
