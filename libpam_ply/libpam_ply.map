@@ -1,0 +1,8 @@
+LIBPAM_MISC_1.0 {
+  global:
+    ply_conv;
+    pam_ply_socket;
+
+  local:
+    *;
+};

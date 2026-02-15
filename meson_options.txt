@@ -20,6 +20,8 @@ option('selinux', type: 'feature', value: 'auto',
        description: 'SELinux support')
 option('nis', type: 'feature', value: 'auto',
        description: 'NIS/YP support in pam_unix')
+option('plymouth', type: 'feature', value: 'auto',
+       description: 'plymouth as GUI support in pam_misc via pam_ply')
 
 option('examples', type: 'boolean', value: true,
        description: 'Build examples')

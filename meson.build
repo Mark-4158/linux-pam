@@ -314,6 +314,11 @@ else
   stringparam_profileconditions += ';no_openssl_hmac'
 endif
 
+libply_boot_client = dependency('ply-boot-client', required: get_option('plymouth'))
+if libply_boot_client.found()
+  cdata.set('USE_PLYMOUTH', 1)
+endif
+
 use_logind = get_option('logind')
 use_elogind = get_option('elogind').require(not use_logind.enabled()).disable_auto_if(use_logind.enabled())
 use_logind = use_logind.disable_auto_if(use_elogind.enabled())
@@ -637,6 +642,9 @@ subdir('po')
 subdir('libpam_internal')
 subdir('libpam')
 subdir('libpamc')
+if libply_boot_client.found()
+  subdir('libpam_ply')
+endif
 subdir('libpam_misc')
 if enable_docs
   subdir('doc')
