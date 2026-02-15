@@ -14,16 +14,30 @@ libpam_misc_map_path = meson.current_source_dir() / libpam_misc_map
 libpam_misc_link_deps = [libpam_misc_map]
 libpam_misc_link_args = ['-Wl,--version-script=' + libpam_misc_map_path]
 
-libpam_misc = shared_library(
-  'pam_misc',
-  sources: libpam_misc_src,
-  include_directories: [libpam_misc_inc, libpamc_inc],
-  dependencies: [libpam_internal_dep, libpam_dep],
-  link_depends: libpam_misc_link_deps,
-  link_args: libpam_misc_link_args,
-  version: libpam_misc_version,
-  install: true,
-)
+if libply_boot_client.found()
+  libpam_misc = shared_library(
+    'pam_misc',
+    sources: libpam_misc_src,
+    include_directories: [libpam_ply_inc, libpam_misc_inc, libpamc_inc],
+    dependencies: [libpam_internal_dep, libpam_dep],
+    link_with: libpam_ply,
+    link_depends: libpam_misc_link_deps,
+    link_args: libpam_misc_link_args,
+    version: libpam_misc_version,
+    install: true,
+  )
+else
+  libpam_misc = shared_library(
+    'pam_misc',
+    sources: libpam_misc_src,
+    include_directories: [libpam_misc_inc, libpamc_inc],
+    dependencies: [libpam_internal_dep, libpam_dep],
+    link_depends: libpam_misc_link_deps,
+    link_args: libpam_misc_link_args,
+    version: libpam_misc_version,
+    install: true,
+  )
+endif
 
 libpam_misc_dep = declare_dependency(
   include_directories: [libpam_misc_inc],

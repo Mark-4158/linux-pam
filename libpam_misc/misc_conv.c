@@ -1,11 +1,39 @@
 /*
- * A generic conversation function for text based applications
- *
- * Written by Andrew Morgan <morgan@linux.kernel.org>
- */
+    Generic conversation function
+    Copyright (C) XXXX-2026  Andrew Morgan <morgan@linux.kernel.org>
+    Copyright (C) 2022-2026  Mark A. Williams, Jr.
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU Lesser General Public License as published
+    by the Free Software Foundation; either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Lesser General Public License for more details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with this program; if not, write to the Free Software Foundation,
+    Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+*/
 
 #include "config.h"
 
+#ifdef USE_PLYMOUTH
+# include <fcntl.h>
+# include <limits.h>
+# include <linux/futex.h>
+# include <linux/sched.h>
+# include <linux/vt.h>
+# include <paths.h>
+# include <sys/ioctl.h>
+# include <sys/mman.h>
+# include <sys/stat.h>
+# include <sys/syscall.h>
+# include <sys/sysmacros.h>
+# include <sys/wait.h>
+#endif
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +45,9 @@
 
 #include <security/pam_appl.h>
 #include <security/pam_misc.h>
+#ifdef USE_PLYMOUTH
+# include <security/pam_ply.h>
+#endif
 
 #include "pam_inline.h"
 #include "pam_i18n.h"
@@ -24,6 +55,12 @@
 #define INPUTSIZE PAM_MISC_CONV_BUFSIZE      /* maximum length of input+1 */
 #define CONV_ECHO_ON  1                            /* types of echo state */
 #define CONV_ECHO_OFF 0
+
+#ifdef USE_PLYMOUTH
+# ifndef _PATH_PLYHOME
+#  define _PATH_PLYHOME _PATH_VARRUN "plymouth"
+# endif
+#endif
 
 /*
  * external timeout definitions - these can be overridden by the
@@ -277,8 +314,13 @@ static int read_string(int echo, const char *prompt, char **retstr)
  * confusing amount of pointer indirection).
  */
 
+#ifdef USE_PLYMOUTH
+static int tui_conv(int num_msg, const struct pam_message **msgm,
+                    struct pam_response **response, void *appdata_ptr)
+#else
 int misc_conv(int num_msg, const struct pam_message **msgm,
 	      struct pam_response **response, void *appdata_ptr)
+#endif
 {
     int count=0;
     struct pam_response *reply;
@@ -402,3 +444,158 @@ failed_conversation:
 
     return PAM_CONV_ERR;
 }
+
+#ifdef USE_PLYMOUTH
+/*
+ * This conversation function is supposed to be a graphical PAM one based on
+ * plymouth(8) via ply_conv(3). Like with tui_conv above, this too is _not_
+ * completely compatible with the Solaris PAM codebase.
+ */
+static int gui_conv(int num_msg, const struct pam_message **msgm,
+                    struct pam_response **response, void *appdata_ptr)
+{
+    int tries = 3;
+
+    do {
+        char cld_arg2[TTY_NAME_MAX + 6] = "--tty=";
+
+        if (!ttyname_r(STDIN_FILENO, cld_arg2 + 6, sizeof cld_arg2 - 6)) {
+            struct stat st;
+
+            if (fstat(STDIN_FILENO, &st) ||
+                ioctl(STDIN_FILENO, VT_WAITACTIVE, minor(st.st_rdev)))
+                continue;
+        }
+
+        struct pam_message msg_txt = {
+            .msg_style = PAM_TEXT_INFO,
+            .msg = cld_arg2 + (sizeof _PATH_TTY + 2),
+        };
+        struct pam_message msg_cmd = {
+            .msg_style = PAM_BINARY_PROMPT,
+            .msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_HAS_ACTIVE_VT,
+        };
+
+        const struct pam_message *msgs[] = { &msg_cmd, &msg_txt };
+        struct pam_response *resp = NULL;
+
+        switch (ply_conv(1, msgs, &resp, NULL)) {
+        case PAM_SUCCESS:
+            {
+                char *const s = resp->resp;
+
+                free(s);
+                free(resp);
+                resp = NULL;
+
+                if (s) {
+                    break;
+                }
+            }
+            msg_cmd.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1";
+            ply_conv(1, msgs, &resp, NULL);
+            [[fallthrough]];
+        default:
+            if (resp) {
+                free(resp->resp);
+                free(resp);
+                resp = NULL;
+            }
+
+            siginfo_t si = { .si_status = EXIT_FAILURE };
+
+            const struct clone_args cl_args = {
+                .flags = CLONE_FS | CLONE_IO | CLONE_PTRACE | CLONE_SYSVSEM
+                                  | CLONE_CLEAR_SIGHAND
+                                  | CLONE_PARENT_SETTID | CLONE_VFORK,
+                .parent_tid = (uintptr_t)&si.si_pid,
+            };
+
+            switch (syscall(SYS_clone3, &cl_args, sizeof cl_args)) {
+            default:
+                while (waitid(P_PID, si.si_pid, &si, WEXITED) &&
+                       errno == EINTR) { }
+
+                if (si.si_code == CLD_EXITED && si.si_status == EXIT_SUCCESS) {
+                    break;
+                }
+            case -1:
+                continue;
+
+            case 0:
+                char cld_arg0[] = "plymouthd";
+                char cld_arg1[] = "--no-boot-log";
+                char *const cld_argv[] = { cld_arg0, cld_arg1, cld_arg2, NULL };
+
+                dup2(open(_PATH_DEVNULL, O_RDWR | O_CLOEXEC | O_NONBLOCK),
+                     STDERR_FILENO);
+
+                execv("/sbin/plymouthd", cld_argv);
+                syscall(SYS_exit, EXIT_FAILURE);
+            }
+        }
+
+        msg_cmd.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_SHOW_SPLASH;
+        ply_conv(2, msgs, &resp, NULL);
+        if (resp) {
+            free(resp->resp);
+            free(resp);
+        }
+
+        return ply_conv(num_msg, msgm, response, appdata_ptr);
+    } while (--tries);
+
+    return tui_conv(num_msg, msgm, response, appdata_ptr);
+}
+
+int misc_conv(int num_msg, const struct pam_message **msgm,
+              struct pam_response **response, void *appdata_ptr)
+{
+    static uint32_t mtx;
+    static int (*conv)(int, const struct pam_message **,
+                       struct pam_response **, void *) = tui_conv;
+
+    if (syscall(SYS_futex, &mtx, FUTEX_TRYLOCK_PI_PRIVATE)) {
+        syscall(SYS_futex, &mtx, FUTEX_WAIT_PRIVATE, 1, NULL);
+    } else {
+        if (getppid() == 1 && getenv("PWD")) {
+            struct pam_message msg_cmd = {
+                .msg_style = PAM_BINARY_PROMPT,
+                .msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1",
+            };
+
+            const struct pam_message *msgs[] = { &msg_cmd };
+            struct pam_response *resp = NULL;
+
+            char cl_stack[sysconf(_SC_PAGESIZE)];
+            struct clone_args cl_args = {
+                .flags = CLONE_FS | CLONE_IO | CLONE_PTRACE | CLONE_SYSVSEM
+                                  | CLONE_PARENT | CLONE_SIGHAND | CLONE_VM,
+                .stack = (uintptr_t)(cl_stack + sizeof cl_stack),
+                .stack_size = sizeof cl_stack,
+            };
+
+            switch (syscall(SYS_clone3, &cl_args, sizeof cl_args)) {
+            case 0:
+                const int fd = open(_PATH_WTMP, O_RDONLY | O_CLOEXEC);
+
+                syscall(SYS_exit, fcntl(fd, F_SETSIG, SIGCONT) ||
+                                  fcntl(fd, F_SETLEASE, F_RDLCK) ||
+                                  raise(SIGSTOP) ||
+                                  ply_conv(1, msgs, &resp, NULL) != PAM_SUCCESS
+                                  ? EXIT_FAILURE : EXIT_SUCCESS);
+                [[fallthrough]];
+            default:
+                conv = gui_conv;
+            case -1:
+                break;
+            }
+        }
+
+        mtx = 1;
+        syscall(SYS_futex, &mtx, FUTEX_WAKE, UINT32_MAX);
+    }
+
+    return conv(num_msg, msgm, response, appdata_ptr);
+}
+#endif /* USE_PLYMOUTH */
