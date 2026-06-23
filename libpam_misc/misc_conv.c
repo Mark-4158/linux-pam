@@ -27,8 +27,11 @@
 # include <linux/sched.h>
 # include <linux/vt.h>
 # include <paths.h>
+# include <poll.h>
+# include <sched.h>
 # include <sys/ioctl.h>
 # include <sys/mman.h>
+# include <sys/socket.h>
 # include <sys/stat.h>
 # include <sys/syscall.h>
 # include <sys/sysmacros.h>
@@ -58,7 +61,7 @@
 
 #ifdef USE_PLYMOUTH
 # ifndef _PATH_PLYHOME
-#  define _PATH_PLYHOME _PATH_VARRUN "plymouth"
+#  define _PATH_PLYHOME (_PATH_VARRUN "plymouth")
 # endif
 #endif
 
@@ -74,6 +77,33 @@ const char *pam_misc_conv_warn_line = N_("...Time is running out...\n");
 const char *pam_misc_conv_die_line  = N_("...Sorry, your time is up!\n");
 
 int pam_misc_conv_died=0;       /* application can probe this for timeout */
+
+#ifdef USE_PLYMOUTH
+static int clthread_cb(void *const p)
+{
+    void *const *const pv = p;
+    const int ret = ((int (*)(void *))pv[0])(pv[1]);
+
+    munmap(pv[2], SIZE_MAX);
+
+    return ret;
+}
+
+static inline int clthread_create(int (*const start_routine)(void *),
+                                  void *const arg)
+{
+    const size_t n = sysconf(_SC_PAGE_SIZE);
+    char *const esp = mmap(NULL, n, PROT_WRITE,
+                           MAP_STACK | MAP_GROWSDOWN
+                                     | MAP_PRIVATE | MAP_ANON | MAP_POPULATE,
+                           -1, 0);
+
+    return clone(clthread_cb, esp + n,
+                 CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | CLONE_FS | CLONE_IO
+                              | CLONE_FILES | CLONE_SYSVSEM,
+                 (void *[]){ start_routine, arg, esp });
+}
+#endif
 
 /*
  * These functions are for binary prompt manipulation.
@@ -446,6 +476,30 @@ failed_conversation:
 }
 
 #ifdef USE_PLYMOUTH
+static inline int waitvt(const int fd)
+{
+    struct stat st[1];
+
+    return -(fstat(fd, st) || ioctl(fd, VT_WAITACTIVE, minor(st->st_rdev)));
+}
+
+static inline int gui_quit(int *const sockfd)
+{
+    struct pam_message msg = {
+        .msg_style = PAM_BINARY_PROMPT,
+        .msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1",
+    };
+
+    const struct pam_message *msgs[] = { &msg };
+    struct pam_response *resp = NULL;
+
+    const int ret = ply_conv(1, msgs, &resp, sockfd);
+
+    free(resp);
+
+    return ret;
+}
+
 /*
  * This conversation function is supposed to be a graphical PAM one based on
  * plymouth(8) via ply_conv(3). Like with tui_conv above, this too is _not_
@@ -455,53 +509,62 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
                     struct pam_response **response, void *appdata_ptr)
 {
     int tries = 3;
+    char plyd_arg2[TTY_NAME_MAX + 6] = "--tty=" _PATH_TTY "7";
+
+    ttyname_r(STDIN_FILENO, plyd_arg2 + 6, sizeof plyd_arg2 - 6);
 
     do {
-        char cld_arg2[TTY_NAME_MAX + 6] = "--tty=";
-
-        if (!ttyname_r(STDIN_FILENO, cld_arg2 + 6, sizeof cld_arg2 - 6)) {
-            struct stat st;
-
-            if (fstat(STDIN_FILENO, &st) ||
-                ioctl(STDIN_FILENO, VT_WAITACTIVE, minor(st.st_rdev)))
-                continue;
-        }
-
-        struct pam_message msg_txt = {
-            .msg_style = PAM_TEXT_INFO,
-            .msg = cld_arg2 + (sizeof _PATH_TTY + 2),
-        };
-        struct pam_message msg_cmd = {
+        struct pam_message msg = {
             .msg_style = PAM_BINARY_PROMPT,
             .msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_HAS_ACTIVE_VT,
         };
 
-        const struct pam_message *msgs[] = { &msg_cmd, &msg_txt };
+        const struct pam_message *msgs[] = { &msg };
         struct pam_response *resp = NULL;
+        int sockfd = -1;
 
-        switch (ply_conv(1, msgs, &resp, NULL)) {
-        case PAM_SUCCESS:
-            {
-                char *const s = resp->resp;
-
-                free(s);
-                free(resp);
-                resp = NULL;
-
-                if (s) {
-                    break;
-                }
-            }
-            msg_cmd.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1";
-            ply_conv(1, msgs, &resp, NULL);
-            [[fallthrough]];
+        switch (waitvt(STDIN_FILENO) ? PAM_SYSTEM_ERR
+                                     : ply_conv(1, msgs, &resp, &sockfd)) {
         default:
-            if (resp) {
-                free(resp->resp);
-                free(resp);
-                resp = NULL;
+            const char *const s = resp->resp;
+
+            free(resp);
+            resp = NULL;
+
+            if (s) {
+                break;
+            }
+            [[fallthrough]];
+
+        case PAM_SYSTEM_ERR:
+            struct ucred cred = { .pid = -1 };
+            socklen_t n = sizeof cred;
+
+            getsockopt(sockfd, SOL_SOCKET, SO_PEERCRED, &cred, &n);
+
+            struct pollfd pfd[] = {
+                { .fd = syscall(SYS_pidfd_open, cred.pid, 0), .events = POLLIN }
+            };
+
+            msg.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1";
+            if (ply_conv(1, msgs, &resp, &sockfd) != PAM_SUCCESS) {
+                tgkill(cred.pid, cred.pid, SIGHUP);
             }
 
+            close(sockfd);
+            free(resp);
+            resp = NULL;
+            sockfd = -1;
+
+            if (pfd->fd != -1) {
+                poll(pfd, 1, 250);
+                close(pfd->fd);
+            } else if (errno != ESRCH) {
+                usleep(250000);
+            }
+            [[fallthrough]];
+
+        case PAM_CONV_ERR:
             siginfo_t si = { .si_status = EXIT_FAILURE };
 
             const struct clone_args cl_args = {
@@ -517,35 +580,60 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
                        errno == EINTR) { }
 
                 if (si.si_code == CLD_EXITED && si.si_status == EXIT_SUCCESS) {
+                    msg.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_SHOW_SPLASH;
+                    ply_conv(1, msgs, &resp, &sockfd);
+
+                    free(resp);
+                    resp = NULL;
+
                     break;
                 }
+                [[fallthrough]];
             case -1:
+                close(sockfd);
                 continue;
 
             case 0:
-                char cld_arg0[] = "plymouthd";
-                char cld_arg1[] = "--no-boot-log";
-                char *const cld_argv[] = { cld_arg0, cld_arg1, cld_arg2, NULL };
+                char plyd_arg0[] = "plymouthd";
+                char plyd_arg1[] = "--no-boot-log";
+                char *const plyd_argv[4] = { plyd_arg0, plyd_arg1, plyd_arg2 };
 
                 dup2(open(_PATH_DEVNULL, O_RDWR | O_CLOEXEC | O_NONBLOCK),
                      STDERR_FILENO);
 
-                execv("/sbin/plymouthd", cld_argv);
+                execvp(plyd_arg0, plyd_argv);
                 syscall(SYS_exit, EXIT_FAILURE);
             }
         }
 
-        msg_cmd.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_SHOW_SPLASH;
-        ply_conv(2, msgs, &resp, NULL);
-        if (resp) {
-            free(resp->resp);
-            free(resp);
-        }
+        msg.msg_style = PAM_TEXT_INFO;
+        msg.msg = plyd_arg2 + (sizeof _PATH_TTY + 2);
+        ply_conv(1, msgs, &resp, &sockfd);
+        free(resp);
 
-        return ply_conv(num_msg, msgm, response, appdata_ptr);
+        tries = ply_conv(num_msg, msgm, response, &sockfd);
+        close(sockfd);
+
+        return tries;
     } while (--tries);
 
     return tui_conv(num_msg, msgm, response, appdata_ptr);
+}
+
+static int gui_cb(void *const quit_cb)
+{
+    {
+        struct pollfd pfd[] = {
+            { .fd = STDIN_FILENO },
+        };
+
+        while (poll(pfd, 1, -1) == -1 ? errno == EINTR
+                                      : pfd->revents == POLLERR) { }
+    }
+
+    return (quit_cb ? ((int (*)(void))quit_cb)()
+                    : gui_quit(NULL) != PAM_SUCCESS) ? EXIT_FAILURE
+                                                     : EXIT_SUCCESS;
 }
 
 int misc_conv(int num_msg, const struct pam_message **msgm,
@@ -558,38 +646,9 @@ int misc_conv(int num_msg, const struct pam_message **msgm,
     if (syscall(SYS_futex, &mtx, FUTEX_TRYLOCK_PI_PRIVATE)) {
         syscall(SYS_futex, &mtx, FUTEX_WAIT_PRIVATE, 1, NULL);
     } else {
-        if (getppid() == 1 && getenv("PWD")) {
-            struct pam_message msg_cmd = {
-                .msg_style = PAM_BINARY_PROMPT,
-                .msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1",
-            };
-
-            const struct pam_message *msgs[] = { &msg_cmd };
-            struct pam_response *resp = NULL;
-
-            char cl_stack[sysconf(_SC_PAGESIZE)];
-            struct clone_args cl_args = {
-                .flags = CLONE_FS | CLONE_IO | CLONE_PTRACE | CLONE_SYSVSEM
-                                  | CLONE_PARENT | CLONE_SIGHAND | CLONE_VM,
-                .stack = (uintptr_t)(cl_stack + sizeof cl_stack),
-                .stack_size = sizeof cl_stack,
-            };
-
-            switch (syscall(SYS_clone3, &cl_args, sizeof cl_args)) {
-            case 0:
-                const int fd = open(_PATH_WTMP, O_RDONLY | O_CLOEXEC);
-
-                syscall(SYS_exit, fcntl(fd, F_SETSIG, SIGCONT) ||
-                                  fcntl(fd, F_SETLEASE, F_RDLCK) ||
-                                  raise(SIGSTOP) ||
-                                  ply_conv(1, msgs, &resp, NULL) != PAM_SUCCESS
-                                  ? EXIT_FAILURE : EXIT_SUCCESS);
-                [[fallthrough]];
-            default:
-                conv = gui_conv;
-            case -1:
-                break;
-            }
+        if (getppid() == 1 && getenv("PWD")
+                           && clthread_create(gui_cb, NULL) != -1) {
+            conv = gui_conv;
         }
 
         mtx = 1;

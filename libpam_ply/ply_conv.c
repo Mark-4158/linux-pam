@@ -148,11 +148,8 @@ static ssize_t conv_recv(const int sockfd, struct pam_response *const resp) {
             goto done;
 
         case 2:
-            if ((res.p = aligned_alloc(sizeof(void *), 0))) {
-                break;
-            }
-            resp->resp_retcode = PAM_BUF_ERR;
-            goto done;
+            res.p = resp;
+            break;
 
         default:
             res.p = NULL;
@@ -172,22 +169,26 @@ done:
 }
 
 int ply_conv(const int num_msg, const struct pam_message **const msgv,
-             struct pam_response **const prespv, void *) {
+             struct pam_response **const prespv, void *appdata_ptr) {
     int ret = PAM_SUCCESS;
 
     mallopt(M_PERTURB, '\xFF');
     do {
-        struct pam_response *const respv =
-            aligned_alloc(sizeof *respv, num_msg * sizeof *respv);
+        struct pam_response *const respv = calloc(num_msg, sizeof *respv);
 
         if (respv) {
-            const int sockfd = pam_ply_socket();
+            const int sockfd = appdata_ptr && *(const int *)appdata_ptr >= 0
+                               ? *(const int *)appdata_ptr
+                               : pam_ply_socket();
 
             if (sockfd == -1) {
                 ret = PAM_CONV_ERR;
             } else {
                 for (unsigned i = 0;;) {
                     if ((unsigned)num_msg == i) {
+                        if (appdata_ptr && *(const int *)appdata_ptr < 0) {
+                            *(int *)appdata_ptr = sockfd;
+			}
                         *prespv = respv;
                         break;
                     }
@@ -211,7 +212,7 @@ int ply_conv(const int num_msg, const struct pam_message **const msgv,
                     break;
                 }
 
-                if (!close(sockfd)) {
+                if ((appdata_ptr && *(const int *)appdata_ptr >= 0) || !close(sockfd)) {
                     break;
                 }
             }

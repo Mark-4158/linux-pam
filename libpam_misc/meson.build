@@ -19,7 +19,7 @@ if libply_boot_client.found()
     'pam_misc',
     sources: libpam_misc_src,
     include_directories: [libpam_ply_inc, libpam_misc_inc, libpamc_inc],
-    dependencies: [libpam_internal_dep, libpam_dep],
+    dependencies: [libpam_internal_dep, libpam_dep, libselinux],
     link_with: libpam_ply,
     link_depends: libpam_misc_link_deps,
     link_args: libpam_misc_link_args,
