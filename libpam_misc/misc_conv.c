@@ -28,9 +28,7 @@
 # include <linux/vt.h>
 # include <paths.h>
 # include <poll.h>
-# include <sched.h>
 # include <sys/ioctl.h>
-# include <sys/mman.h>
 # include <sys/socket.h>
 # include <sys/stat.h>
 # include <sys/syscall.h>
@@ -77,33 +75,6 @@ const char *pam_misc_conv_warn_line = N_("...Time is running out...\n");
 const char *pam_misc_conv_die_line  = N_("...Sorry, your time is up!\n");
 
 int pam_misc_conv_died=0;       /* application can probe this for timeout */
-
-#ifdef USE_PLYMOUTH
-static int clthread_cb(void *const p)
-{
-    void *const *const pv = p;
-    const int ret = ((int (*)(void *))pv[0])(pv[1]);
-
-    munmap(pv[2], SIZE_MAX);
-
-    return ret;
-}
-
-static inline int clthread_create(int (*const start_routine)(void *),
-                                  void *const arg)
-{
-    const size_t n = sysconf(_SC_PAGE_SIZE);
-    char *const esp = mmap(NULL, n, PROT_WRITE,
-                           MAP_STACK | MAP_GROWSDOWN
-                                     | MAP_PRIVATE | MAP_ANON | MAP_POPULATE,
-                           -1, 0);
-
-    return clone(clthread_cb, esp + n,
-                 CLONE_THREAD | CLONE_SIGHAND | CLONE_VM | CLONE_FS | CLONE_IO
-                              | CLONE_FILES | CLONE_SYSVSEM,
-                 (void *[]){ start_routine, arg, esp });
-}
-#endif
 
 /*
  * These functions are for binary prompt manipulation.
@@ -514,6 +485,8 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
     ttyname_r(STDIN_FILENO, plyd_arg2 + 6, sizeof plyd_arg2 - 6);
 
     do {
+        static int killfd = -1;
+
         struct pam_message msg = {
             .msg_style = PAM_BINARY_PROMPT,
             .msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_HAS_ACTIVE_VT,
@@ -523,8 +496,14 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
         struct pam_response *resp = NULL;
         int sockfd = -1;
 
-        switch (waitvt(STDIN_FILENO) ? PAM_SYSTEM_ERR
-                                     : ply_conv(1, msgs, &resp, &sockfd)) {
+        struct ucred cred = { -1, -1, -1 };
+        socklen_t n = sizeof cred;
+
+        if (waitvt(STDIN_FILENO)) {
+            continue;
+        }
+
+        switch (ply_conv(1, msgs, &resp, &sockfd)) {
         default:
             const char *const s = resp->resp;
 
@@ -534,16 +513,13 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
             if (s) {
                 break;
             }
-            [[fallthrough]];
-
-        case PAM_SYSTEM_ERR:
-            struct ucred cred = { .pid = -1 };
-            socklen_t n = sizeof cred;
-
             getsockopt(sockfd, SOL_SOCKET, SO_PEERCRED, &cred, &n);
 
             struct pollfd pfd[] = {
-                { .fd = syscall(SYS_pidfd_open, cred.pid, 0), .events = POLLIN }
+                {
+                    .fd = syscall(SYS_pidfd_open, cred.pid, 0),
+                    .events = POLLIN,
+                },
             };
 
             msg.msg = PLY_BOOT_PROTOCOL_REQUEST_TYPE_QUIT "\2\2\1";
@@ -551,13 +527,15 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
                 tgkill(cred.pid, cred.pid, SIGHUP);
             }
 
-            close(sockfd);
             free(resp);
             resp = NULL;
+
+            close(sockfd);
             sockfd = -1;
+            n = sizeof cred;
 
             if (pfd->fd != -1) {
-                poll(pfd, 1, 250);
+                while (poll(pfd, 1, -1) == -1 && errno == EINTR) { }
                 close(pfd->fd);
             } else if (errno != ESRCH) {
                 usleep(250000);
@@ -568,11 +546,15 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
             siginfo_t si = { .si_status = EXIT_FAILURE };
 
             const struct clone_args cl_args = {
-                .flags = CLONE_FS | CLONE_IO | CLONE_PTRACE | CLONE_SYSVSEM
-                                  | CLONE_CLEAR_SIGHAND
-                                  | CLONE_PARENT_SETTID | CLONE_VFORK,
+                .flags = CLONE_VFORK | CLONE_FS | CLONE_IO | CLONE_SYSVSEM
+                                     | CLONE_CLEAR_SIGHAND
+                                     | CLONE_PARENT_SETTID,
                 .parent_tid = (uintptr_t)&si.si_pid,
             };
+
+            if (cred.pid == -1 && fcntl(killfd, F_GETOWN) != -1) {
+                continue;
+            }
 
             switch (syscall(SYS_clone3, &cl_args, sizeof cl_args)) {
             default:
@@ -586,6 +568,7 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
                     free(resp);
                     resp = NULL;
 
+                    waitvt(STDIN_FILENO);
                     break;
                 }
                 [[fallthrough]];
@@ -597,6 +580,8 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
                 char plyd_arg0[] = "plymouthd";
                 char plyd_arg1[] = "--no-boot-log";
                 char *const plyd_argv[4] = { plyd_arg0, plyd_arg1, plyd_arg2 };
+
+                signal(SIGHUP, SIG_IGN);
 
                 dup2(open(_PATH_DEVNULL, O_RDWR | O_CLOEXEC | O_NONBLOCK),
                      STDERR_FILENO);
@@ -612,28 +597,24 @@ static int gui_conv(int num_msg, const struct pam_message **msgm,
         free(resp);
 
         tries = ply_conv(num_msg, msgm, response, &sockfd);
+
+        getsockopt(sockfd, SOL_SOCKET, SO_PEERCRED, &cred, &n);
         close(sockfd);
+
+        if (fcntl(killfd, F_GETOWN) != cred.pid) {
+            fcntl(killfd, F_NOTIFY, 0);
+            close(killfd);
+
+            killfd = open(_PATH_DEV "char",
+                          O_RDONLY | O_ASYNC | O_CLOEXEC | O_DIRECTORY);
+            fcntl(killfd, F_SETOWN, cred.pid);
+            fcntl(killfd, F_NOTIFY, DN_RENAME);
+        }
 
         return tries;
     } while (--tries);
 
     return tui_conv(num_msg, msgm, response, appdata_ptr);
-}
-
-static int gui_cb(void *const quit_cb)
-{
-    {
-        struct pollfd pfd[] = {
-            { .fd = STDIN_FILENO },
-        };
-
-        while (poll(pfd, 1, -1) == -1 ? errno == EINTR
-                                      : pfd->revents == POLLERR) { }
-    }
-
-    return (quit_cb ? ((int (*)(void))quit_cb)()
-                    : gui_quit(NULL) != PAM_SUCCESS) ? EXIT_FAILURE
-                                                     : EXIT_SUCCESS;
 }
 
 int misc_conv(int num_msg, const struct pam_message **msgm,
@@ -646,8 +627,7 @@ int misc_conv(int num_msg, const struct pam_message **msgm,
     if (syscall(SYS_futex, &mtx, FUTEX_TRYLOCK_PI_PRIVATE)) {
         syscall(SYS_futex, &mtx, FUTEX_WAIT_PRIVATE, 1, NULL);
     } else {
-        if (getppid() == 1 && getenv("PWD")
-                           && clthread_create(gui_cb, NULL) != -1) {
+        if (getppid() == 1 && getenv("PWD")) {
             conv = gui_conv;
         }
 
