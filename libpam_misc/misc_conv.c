@@ -627,7 +627,7 @@ int misc_conv(int num_msg, const struct pam_message **msgm,
     if (syscall(SYS_futex, &mtx, FUTEX_TRYLOCK_PI_PRIVATE)) {
         syscall(SYS_futex, &mtx, FUTEX_WAIT_PRIVATE, 1, NULL);
     } else {
-        if (getppid() == 1 && getenv("PWD")) {
+        if (getppid() == 1 && tcgetsid(STDIN_FILENO) == getpid()) {
             conv = gui_conv;
         }
 
